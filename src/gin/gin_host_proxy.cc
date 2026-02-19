@@ -16,6 +16,8 @@
 #include "compiler.h"
 
 NCCL_PARAM(GinProxyQueueSize, "GIN_PROXY_QUEUE_SIZE", -1);
+NCCL_PARAM(GinProxyExtraPoll, "GIN_PROXY_EXTRA_POLL", 0);  // Disabled by default
+NCCL_PARAM(GinProxyGfdPerProgress, "GIN_PROXY_GFD_PER_PROGRESS", 1);
 extern int64_t ncclParamIbDataDirect();
 extern int64_t ncclParamDmaBufEnable();
 
@@ -67,6 +69,8 @@ struct ginProxyCtx {
   void *signalsGinHandle;
   uint64_t *signalsDev;
   int hasError;
+  int extraPoll;  // Enable extra proxyGinPollCompletions call
+  int gfdPerProgress;  // Number of GFDs to poll per progress call
 };
 
 // Depending on GDR, allocate memory on the CPU or GPU.
@@ -329,6 +333,8 @@ ncclResult_t ncclGinProxyCreateContext(struct ncclComm *comm, void *collComm, in
 
   proxyCtx->comm = comm;
   proxyCtx->collComm = collComm;
+  proxyCtx->extraPoll = ncclParamGinProxyExtraPoll();
+  proxyCtx->gfdPerProgress = ncclParamGinProxyGfdPerProgress();
 
   // Sanitize the queue size
   NCCLCHECK(ginComm->getProperties(devId, &proxyCtx->props));
@@ -481,15 +487,22 @@ ncclResult_t ncclGinProxyProgress(ncclGin_t *ginComm, void *ginCtx) {
   NCCLCHECK(proxyGinPollCompletions(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx));
   for (int targetRank = 0; targetRank < ctx->comm->nRanks; targetRank++) {
     // Poll on the GFD queue
-    ncclGinProxyGfd_t gfd;
-    struct ginProxyGfdState *state = NULL;
-    if (proxyGinPollGfd(ctx, ctx->hostGpuCtx, targetRank, &gfd, &state)) {
+    int numGfdToPoll = ctx->gfdPerProgress;
+    for (int i = 0; i < numGfdToPoll; ++i) {
+      ncclGinProxyGfd_t gfd;
+      struct ginProxyGfdState *state = NULL;
+      if (!proxyGinPollGfd(ctx, ctx->hostGpuCtx, targetRank, &gfd, &state)) break;
+
       ncclResult_t ret =
         proxyGinProcessGfd(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx, targetRank, &gfd, state);
       if (ret) ctx->hasError = ret;
       NCCLCHECK(ret);
     }
+
     if (ginComm->ginProgress) ginComm->ginProgress(ctx->collComm);
+  }
+  if (ctx->extraPoll) {
+    NCCLCHECK(proxyGinPollCompletions(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx));
   }
 
   return ncclSuccess;
