@@ -30,6 +30,7 @@ struct ncclGinState {
   std::mutex mutex;
   std::condition_variable cond;
   ncclResult_t asyncResult;
+  volatile int histogramRecording; // Toggled by signal handler to start/stop histogram recording
 
   int signalSpaceSize;
   int counterSpaceSize;
@@ -54,5 +55,7 @@ ncclResult_t ncclGinAllocSignalsCounters(struct ncclComm* comm, int nSignals, ui
 ncclResult_t ncclGinFreeSignalsCounters(struct ncclComm* comm, uint32_t signal0, int nSignals,
                                         uint32_t counter0, int nCounters);
 ncclResult_t ncclGinQueryLastError(struct ncclGinState* ginState, bool* hasError);
+
+#define PROFILE_PLUGIN  (1)     // 0: profile NCCL; 1: profile plugin
 
 #endif

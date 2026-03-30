@@ -14,8 +14,13 @@
 #include "plugin/nccl_net.h"
 #include "nccl_device/gin/proxy/gin_proxy_device_host_common.h"
 #include "compiler.h"
+#include "histogram.h"
+
+using gin_proxy_histogram_t = timer_histogram<histogram_custom_binner<size_t>>;
 
 NCCL_PARAM(GinProxyQueueSize, "GIN_PROXY_QUEUE_SIZE", -1);
+NCCL_PARAM(GinProxyGfdPerProgress, "GIN_PROXY_GFD_PER_PROGRESS", 1);
+NCCL_PARAM(GinProxyReducedPluginProgress, "GIN_PROXY_REDUCED_PLUGIN_PROGRESS", 0); // Disabled by defult
 extern int64_t ncclParamIbDataDirect();
 extern int64_t ncclParamDmaBufEnable();
 
@@ -67,6 +72,10 @@ struct ginProxyCtx {
   void *signalsGinHandle;
   uint64_t *signalsDev;
   int hasError;
+  uint16_t gfdPerProgress;
+  gin_proxy_histogram_t *hist_poll_completions;
+  gin_proxy_histogram_t *hist_poll_gfd;
+  gin_proxy_histogram_t *hist_plugin_progress;
 };
 
 // Depending on GDR, allocate memory on the CPU or GPU.
@@ -123,7 +132,8 @@ static ncclResult_t getDmaBufFd(void *addr, size_t length, int *fd,
 
 static ncclResult_t proxyGinPollCompletions(ncclGin_t *ginComm, void *collComm,
                                             struct ginProxyCtx *ctx,
-                                            struct ginProxyHostGpuCtx *hostGpuCtx) {
+                                            struct ginProxyHostGpuCtx *hostGpuCtx, int *count) {
+  int reqPolled = 0;
   for (int targetRank = 0; targetRank < ctx->comm->nRanks; targetRank++) {
     // loop on all seen but unconsumed GFDs
     for (uint32_t i = hostGpuCtx->cisShadow[targetRank]; i < hostGpuCtx->sis[targetRank]; i++) {
@@ -144,6 +154,7 @@ static ncclResult_t proxyGinPollCompletions(ncclGin_t *ginComm, void *collComm,
                   ctx->counters[state->counterId]);
           }
         }
+        reqPolled++;
       }
       // allow holes in the CI space to get resolved
       if (state->done && i == hostGpuCtx->cisShadow[targetRank]) {
@@ -155,6 +166,7 @@ static ncclResult_t proxyGinPollCompletions(ncclGin_t *ginComm, void *collComm,
     }
   }
 
+  if (count) *count = reqPolled;
   return ncclSuccess;
 }
 
@@ -329,6 +341,7 @@ ncclResult_t ncclGinProxyCreateContext(struct ncclComm *comm, void *collComm, in
 
   proxyCtx->comm = comm;
   proxyCtx->collComm = collComm;
+  proxyCtx->gfdPerProgress = ncclParamGinProxyGfdPerProgress();
 
   // Sanitize the queue size
   NCCLCHECK(ginComm->getProperties(devId, &proxyCtx->props));
@@ -416,6 +429,15 @@ ncclResult_t ncclGinProxyCreateContext(struct ncclComm *comm, void *collComm, in
   *outDevHandle = devHandle;
   *outGinCtx = proxyCtx;
 
+  // Initialize timer histograms for ncclGinProxyProgress profiling
+  //static std::vector<size_t> bins = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1500, 2000};
+  // 260319 different binner
+  static std::vector<size_t> bins = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1500, 2000, 5000, 10000, 15000};
+  static const std::chrono::nanoseconds ovh(25);
+  proxyCtx->hist_poll_completions = new gin_proxy_histogram_t("gin proxy pollCompletions()", histogram_custom_binner<size_t>(bins), ovh);
+  proxyCtx->hist_poll_gfd = new gin_proxy_histogram_t("gin proxy pollGfd+processGfd()", histogram_custom_binner<size_t>(bins), ovh);
+  proxyCtx->hist_plugin_progress = new gin_proxy_histogram_t("gin proxy ginProgress()", histogram_custom_binner<size_t>(bins), ovh);
+
   return ncclSuccess;
 }
 
@@ -469,6 +491,11 @@ ncclResult_t ncclGinProxyDestroyContext(ncclGin_t *ginComm, void *ginCtx) {
       free(devHandle);
     }
 
+    // Print and free histograms
+    if (ctx->hist_poll_completions) { ctx->hist_poll_completions->print_stats(); delete ctx->hist_poll_completions; }
+    if (ctx->hist_poll_gfd) { ctx->hist_poll_gfd->print_stats(); delete ctx->hist_poll_gfd; }
+    if (ctx->hist_plugin_progress) { ctx->hist_plugin_progress->print_stats(); delete ctx->hist_plugin_progress; }
+
     free(ctx);
   }
 
@@ -477,20 +504,55 @@ ncclResult_t ncclGinProxyDestroyContext(ncclGin_t *ginComm, void *ginCtx) {
 
 ncclResult_t ncclGinProxyProgress(ncclGin_t *ginComm, void *ginCtx) {
   struct ginProxyCtx *ctx = (struct ginProxyCtx *)ginCtx;
+#if (PROFILE_PLUGIN == 0)
+  int rec = ctx->comm->sharedRes->ginState.histogramRecording;
+#else
+  int rec = 0; // disable NCCL profiling
+#endif
+  //int rec2 = ctx->comm->sharedRes->ginState.histogramRecording;
 
-  NCCLCHECK(proxyGinPollCompletions(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx));
+  int reqPolled = 0;
+  //if (rec2) ctx->hist_poll_completions->start_timer();
+
+  if (rec) ctx->hist_poll_completions->start_timer();
+  NCCLCHECK(proxyGinPollCompletions(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx, &reqPolled));
+  if (rec) ctx->hist_poll_completions->stop_timer(reqPolled);
+
+  int gfdProcessed = 0;
+  if (rec) ctx->hist_poll_gfd->start_timer();
   for (int targetRank = 0; targetRank < ctx->comm->nRanks; targetRank++) {
     // Poll on the GFD queue
-    ncclGinProxyGfd_t gfd;
-    struct ginProxyGfdState *state = NULL;
-    if (proxyGinPollGfd(ctx, ctx->hostGpuCtx, targetRank, &gfd, &state)) {
-      ncclResult_t ret =
-        proxyGinProcessGfd(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx, targetRank, &gfd, state);
-      if (ret) ctx->hasError = ret;
-      NCCLCHECK(ret);
+    int numGfdToPoll = ctx->gfdPerProgress;
+    for (int i = 0; i < numGfdToPoll; ++i) {  // Test pulling more GFD
+      ncclGinProxyGfd_t gfd;
+      struct ginProxyGfdState *state = NULL;
+      if (proxyGinPollGfd(ctx, ctx->hostGpuCtx, targetRank, &gfd, &state)) {
+        ncclResult_t ret =
+          proxyGinProcessGfd(ginComm, ctx->collComm, ctx, ctx->hostGpuCtx, targetRank, &gfd, state);
+        if (ret) ctx->hasError = ret;
+        gfdProcessed++;
+        NCCLCHECK(ret);
+      } else {
+        // no more GFD for current targetRank
+        break;
+      }
     }
-    if (ginComm->ginProgress) ginComm->ginProgress(ctx->collComm);
   }
+  if (rec) ctx->hist_poll_gfd->stop_timer(gfdProcessed);
+
+  // 20260228 only do one ginProgress() per loop to save some cycles.
+  int num_cq_entries = gfdProcessed;
+  if (ginComm->ginProgress) {
+    if (rec) ctx->hist_plugin_progress->start_timer();
+#if (PROFILE_PLUGIN == 0)
+    ginComm->ginProgress(ctx->collComm, &num_cq_entries);
+#else
+    ginComm->ginProgress(ctx->collComm, nullptr);
+#endif
+    if (rec) ctx->hist_plugin_progress->stop_timer(num_cq_entries);
+  }
+
+  //if (rec2) ctx->hist_poll_completions->stop_timer(reqPolled + gfdProcessed + num_cq_entries);
 
   return ncclSuccess;
 }

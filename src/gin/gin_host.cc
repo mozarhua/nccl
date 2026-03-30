@@ -12,11 +12,28 @@
 #include "gin/gin_host.h"
 #include "gin/gin_host_proxy.h"
 #include "compiler.h"
+#include <signal.h>
 
 NCCL_PARAM(GinEnable, "GIN_ENABLE", 1);
 NCCL_PARAM(GinType, "GIN_TYPE", -1);
 NCCL_PARAM(GinSignalPoolSize, "GIN_SIGNAL_POOL_SIZE", 64 << 10);
 NCCL_PARAM(GinCounterPoolSize, "GIN_COUNTER_POOL_SIZE", 64 << 10);
+NCCL_PARAM(GinHistogramSignal, "GIN_HISTOGRAM_SIGNAL", -1);
+
+static struct ncclGinState* ncclLastGinState;
+
+void ncclGinToggleHistogram(int sig) {
+  if (ncclLastGinState) {
+    int prev = ncclLastGinState->histogramRecording;
+    ncclLastGinState->histogramRecording = !prev;
+    INFO(NCCL_ALL, "GIN histogram recording %s (signal %d)",
+         ncclLastGinState->histogramRecording ? "started" : "stopped", sig);
+#if(PROFILE_PLUGIN == 1)
+    ncclLastGinState->ncclGin->closeListen(ncclLastGinState->histogramRecording
+                                           ? (void*)0xFFFFFFFF : (void*)0xFFFFFFFE);
+#endif
+  }
+}
 
 ncclResult_t getGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) {
@@ -42,6 +59,10 @@ ncclResult_t getGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
 
 void* ncclGinProgress(struct ncclGinState* ginState_) {
   struct ncclGinState* ginState = (struct ncclGinState*)ginState_;
+  const int sig = ncclParamGinHistogramSignal();
+  if (sig != -1) signal(sig, ncclGinToggleHistogram);
+  ncclLastGinState = ginState;
+  ginState->histogramRecording = 0;
   while (1) {
     std::unique_lock<std::mutex> lock(ginState->mutex);
     if (ginState->ginProgress == 1) {
@@ -51,7 +72,7 @@ void* ncclGinProgress(struct ncclGinState* ginState_) {
         if (ginState->ginType == NCCL_GIN_TYPE_PROXY) {
           ret = ncclGinProxyProgress(ginState->ncclGin, ginState->ginCtx[n]);
         } else {
-          ret = ginState->ncclGin->ginProgress(ginState->ginComms[n]);
+          ret = ginState->ncclGin->ginProgress(ginState->ginComms[n], nullptr);
         }
         if (ret != ncclSuccess) {
           COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
