@@ -333,7 +333,7 @@ ncclResult_t ncclGinIbGdakiDestroyContext(void* ginCtx) {
   return ncclGinGdakiDestroyContext(ginCtx);
 }
 
-ncclResult_t ncclGinIbGdakiProgress(void *collComm)
+ncclResult_t ncclGinIbGdakiProgress(void *collComm, int* ptr)
 {
   return ncclGinGdakiProgress(collComm);
 }

@@ -92,6 +92,11 @@ static ncclResult_t ncclGin_getProperties(int dev, ncclNetProperties_t* props) {
   return ncclSuccess;
 }
 
+static ncclResult_t ncclGin_v12_ginProgress(void* collComm, int* num_cq_entries) {
+  (void)num_cq_entries;
+  return ncclGin_v12->ginProgress(collComm);
+}
+
 ncclGin_t* getNcclGin_v12(void* lib) {
   ncclGin_v12 = (ncclGin_v12_t*)ncclOsDlsym(lib, "ncclGinPlugin_v12");
   if (ncclGin_v12) {
@@ -114,7 +119,7 @@ ncclGin_t* getNcclGin_v12(void* lib) {
     ncclGin.iget = NULL;
     ncclGin.iflush = ncclGin_iflush;
     ncclGin.test = ncclGin_v12->test;
-    ncclGin.ginProgress = ncclGin_v12->ginProgress;
+    ncclGin.ginProgress = ncclGin_v12->ginProgress ? ncclGin_v12_ginProgress : nullptr;
     ncclGin.queryLastError = ncclGin_v12->queryLastError;
     ncclGin.finalize = ncclGin_v12->finalize;
     return &ncclGin;

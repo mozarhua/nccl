@@ -15,8 +15,25 @@
 #include "gin/gin_host_proxy.h"
 #include "compiler.h"
 #include <cmath>
+#include <signal.h>
 
 NCCL_PARAM(GinEnable, "GIN_ENABLE", 1);
+NCCL_PARAM(GinHistogramSignal, "GIN_HISTOGRAM_SIGNAL", -1);
+
+static struct ncclGinState* ncclLastGinState;
+
+void ncclGinToggleHistogram(int sig) {
+  if (ncclLastGinState) {
+    int prev = ncclLastGinState->histogramRecording;
+    ncclLastGinState->histogramRecording = !prev;
+    INFO(NCCL_ALL, "GIN histogram recording %s (signal %d)",
+         ncclLastGinState->histogramRecording ? "started" : "stopped", sig);
+#if(PROFILE_PLUGIN == 1)
+    ncclLastGinState->ncclGin->closeListen(ncclLastGinState->histogramRecording
+                                           ? (void*)0xFFFFFFFF : (void*)0xFFFFFFFE);
+#endif
+  }
+}
 
 ncclResult_t getGlobalGinType(struct ncclComm* comm, ncclGinType_t* ginType) {
   if (comm == nullptr || ginType == nullptr) {
@@ -83,13 +100,17 @@ ncclResult_t setLocalGinType(struct ncclComm* comm) {
 
 void* ncclGinProgress(struct ncclGinState* ginState_) {
   struct ncclGinState* ginState = (struct ncclGinState*)ginState_;
+  const int sig = ncclParamGinHistogramSignal();
+  if (sig != -1) signal(sig, ncclGinToggleHistogram);
+  ncclLastGinState = ginState;
+  ginState->histogramRecording = 0;
   while (1) {
     std::unique_lock<std::mutex> lock(ginState->mutex);
     if (ginState->ginProgress == 1) {
       struct ncclGinStateDevComm* dc = ginState->devComms;
       while (dc) {
         for (int n=0; n<ginState->ginCommCount; n++) {
-          ncclResult_t ret = ginState->ncclGin->ginProgress(dc->ginCtx[n]);
+          ncclResult_t ret = ginState->ncclGin->ginProgress(dc->ginCtx[n], nullptr);
           if (ret != ncclSuccess) {
             COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
             INFO(NCCL_ALL,"%s:%d -> %d [GIN Progress Thread]", __FILE__, __LINE__, ret);

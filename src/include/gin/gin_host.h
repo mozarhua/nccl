@@ -38,6 +38,7 @@ struct ncclGinState {
   std::condition_variable cond;
   ncclResult_t asyncResult;
   int ginVersion;
+  volatile int histogramRecording; // Toggled by signal handler to start/stop histogram recording
 
   struct ncclGinStateDevComm* devComms;
   ncclGinConnectionType_t ginConnectionType;
@@ -67,5 +68,7 @@ ncclResult_t ncclGinRegister(struct ncclComm* comm, void* address, size_t size,
 ncclResult_t ncclGinDeregister(struct ncclComm* comm, void* ginHostWins[NCCL_GIN_MAX_CONNECTIONS]);
 
 ncclResult_t ncclGinQueryLastError(struct ncclGinState* ginState, bool* hasError);
+
+#define PROFILE_PLUGIN  (1)     // 0: profile NCCL; 1: profile plugin
 
 #endif

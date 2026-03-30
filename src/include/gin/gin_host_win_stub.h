@@ -58,7 +58,7 @@ struct ncclGin {
   ncclResult_t (*iput)(void* ginCtx, int context, uint64_t srcOff, void* srcMhandle, size_t size, uint64_t dstOff, void* dstMhandle, uint32_t rank, void** request);
   ncclResult_t (*iputSignal)(void* ginCtx, int context, uint64_t srcOff, void* srcMhandle, size_t size, uint64_t dstOff, void* dstMhandle, uint32_t rank, uint64_t signalOff, void* signalMhandle, uint64_t signalValue, uint32_t signalOp, void** request);
   ncclResult_t (*test)(void* collComm, void* request, int* done);
-  ncclResult_t (*ginProgress)(void* ginCtx);
+  ncclResult_t (*ginProgress)(void* ginCtx, int* num_cq_entries);
   ncclResult_t (*queryLastError)(void* ginCtx, bool* hasError);
   ncclResult_t (*finalize)(void* ctx);
 };

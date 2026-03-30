@@ -62,7 +62,7 @@ typedef struct {
   ncclResult_t (*test)(void* collComm, void* request, int* done);
 
   // Progress function. Will be called if non-NULL in GIN_PROXY mode, or if devHandle.needsProxyProgress=1.
-  ncclResult_t (*ginProgress)(void* ginCtx);
+  ncclResult_t (*ginProgress)(void* ginCtx, int* num_cq_entries);
 
   // Query the last error for the GIN support. Particularly important when ginProgress is not used, to report errors.
   ncclResult_t (*queryLastError)(void* ginCtx, bool *hasError);
