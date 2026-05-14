@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -1082,7 +1083,8 @@ PairedBenchResult runPairedBenchmark(
     int num_iters,
     size_t dispatch_bytes,
     size_t combine_bytes,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int histogram_signal = -1
 ) {
     // Warmup with paired dispatch+combine
     // Note: cudaStreamSynchronize between dispatch and combine is required for HT mode
@@ -1093,6 +1095,12 @@ PairedBenchResult runPairedBenchmark(
         combine_fn();
         CUDACHECK(cudaStreamSynchronize(stream));
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+
+    // Toggle histogram recording on after warmup
+    if (histogram_signal != -1) {
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+        kill(getpid(), histogram_signal);
     }
 
     // Create events for dispatch, combine, and total timing
@@ -1121,6 +1129,12 @@ PairedBenchResult runPairedBenchmark(
         combine_fn();
         CUDACHECK(cudaEventRecord(combine_end[i], stream));    // Record before sync
         CUDACHECK(cudaStreamSynchronize(stream));             // Sync outside timing
+        MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
+    }
+
+    // Toggle histogram recording off after benchmark iterations
+    if (histogram_signal != -1) {
+        kill(getpid(), histogram_signal);
         MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     }
 
@@ -1703,6 +1717,13 @@ int main(int argc, char* argv[]) {
     bool validate_data = false;  // Validate dispatch/combine correctness
     bool dynamic_tokens = false;  // Enable dynamic token allocation (HT only, for random topk)
 
+    // Read histogram signal from environment (same env var as NCCL GIN)
+    int histogram_signal = -1;
+    {
+        const char* sig_env = getenv("NCCL_GIN_HISTOGRAM_SIGNAL");
+        if (sig_env) histogram_signal = atoi(sig_env);
+    }
+
     // Initialize MPI
     MPICHECK(MPI_Init(&argc, &argv));
     MPICHECK(MPI_Comm_rank(MPI_COMM_WORLD, &myRank));
@@ -1846,6 +1867,8 @@ int main(int argc, char* argv[]) {
         printf("  NVLink:          %s\n", disable_nvlink ? "disabled (force RDMA intranode, LL only)" : "enabled");
         printf("  Validate mode:   %s\n", validate_data ? "enabled" : "disabled");
         printf("  Dynamic tokens:  %s\n", dynamic_tokens ? "enabled (NCCL_EP_AUTO)" : "disabled");
+        if (histogram_signal != -1)
+            printf("  Histogram signal: %d (NCCL_GIN_HISTOGRAM_SIGNAL)\n", histogram_signal);
         printf("\n");
     }
 
@@ -2080,7 +2103,7 @@ int main(int argc, char* argv[]) {
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
     PairedBenchResult paired_result = runPairedBenchmark(
         dispatch_fn, combine_fn, actual_warmup, actual_iters,
-        dispatch_data_bytes, combine_data_bytes, stream);
+        dispatch_data_bytes, combine_data_bytes, stream, histogram_signal);
 
     ktimer.stop();
 
