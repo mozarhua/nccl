@@ -15,6 +15,7 @@
 #include "nccl_device/gin/gin_device_host_common.h"
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 
 #define NCCL_GIN_MAX_ACTIVE_BACKENDS 4
 struct ncclGinStateDevComm {
@@ -37,14 +38,31 @@ struct ncclGinBackendState {
   bool supportsVASignals;
 };
 
+// Per-thread GIN progress thread state machine.
+enum ncclGinProgressState {
+  ncclGinProgressPaused        =  0,  // Paused -- waiting for cond signal.
+  ncclGinProgressRunning       =  1,  // Running -- traversing devComms.
+  ncclGinProgressPauseReq      =  2,  // Pause requested -- will ack by moving to Paused.
+  ncclGinProgressExit          = -1,  // Clean shutdown requested.
+  ncclGinProgressError         = -2,  // Terminal error.
+};
+
 struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;              // True if any backend is loaded on this comm.
-  bool proxyThreadCreated;     // Set once the GIN progress thread is spawned.
-  bool proxyThreadStopSignal;  // Signals the GIN progress thread to exit.
-  std::thread thread;
-  std::mutex mutex;
+
+  // Per-thread GIN progress state. We run `proxyNthreads` progress threads;
+  // thread t owns connections t, t+proxyNthreads, t+2*proxyNthreads, ...
+  // (of backends[0]) across all devComms in the list below. Since
+  // proxyNthreads <= ginCommCount <= NCCL_GIN_MAX_CONNECTIONS, these arrays are
+  // safely sized.
+  int proxyNthreads;           // Number of GIN progress threads.
+  bool proxyThreadsStarted;         // True once progress threads have been spawned.
+  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine: 0=paused, 1=running, 2=pause-requested, -1=exit, -2=errored
+  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
+  std::mutex mutex[NCCL_GIN_MAX_CONNECTIONS];
+  std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
   ncclResult_t asyncResult;
 
   struct ncclGinStateDevComm* devComms;
