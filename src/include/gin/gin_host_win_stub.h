@@ -19,7 +19,8 @@
 #include "plugin/nccl_net.h"
 #include "os.h"
 #include <thread>
-#include <mutex>
+#include <atomic>
+#include <shared_mutex>
 
 #define NCCL_GIN_MAX_CONNECTIONS 4
 
@@ -90,14 +91,22 @@ struct ncclGinBackendState {
   bool supportsVASignals;
 };
 
+// GIN progress thread state (single atomic shared by all threads).
+enum ncclGinProgressState {
+  ncclGinProgressNotStarted    =  0,
+  ncclGinProgressRunning       =  1,
+  ncclGinProgressWritePending  =  2,
+  ncclGinProgressStop          = -1,
+};
+
 struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;
-  bool proxyThreadCreated;
-  bool proxyThreadStopSignal;
-  std::thread thread;
-  std::mutex mutex;
+  int proxyNthreads;
+  std::atomic<int> progressState{ncclGinProgressNotStarted};
+  std::shared_timed_mutex devCommRwMutex;
+  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
   ncclResult_t asyncResult;
   struct ncclGinStateDevComm* devComms;
   ncclGinConnectionType_t ginConnectionType;

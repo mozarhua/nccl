@@ -40,35 +40,55 @@ ncclResult_t ncclGetRailedGinType(struct ncclComm* comm, ncclGinType_t* ginType)
   return ncclSuccess;
 }
 
-void* ncclGinProgress(struct ncclGinState* ginState_) {
-  struct ncclGinState* ginState = (struct ncclGinState*)ginState_;
+// Writer helpers: signal readers to back off, acquire exclusive lock, mutate, release, resume.
+static void ginProgressWriteLock(struct ncclGinState* ginState) {
+  ginState->progressState.store(ncclGinProgressWritePending, std::memory_order_release);
+  ginState->devCommRwMutex.lock();
+}
+
+static void ginProgressWriteUnlock(struct ncclGinState* ginState) {
+  ginState->devCommRwMutex.unlock();
+  ginState->progressState.store(ncclGinProgressRunning, std::memory_order_release);
+}
+
+// Per-thread progress worker. Thread t owns GIN connections t, t+proxyNthreads, t+2*proxyNthreads, ...
+// across all devComms.
+void* ncclGinProgress(struct ncclGinState* ginState, int threadIdx) {
   if (ncclOsCpuCount(ginState->cpuAffinity)) {
     ncclOsSetAffinity(ginState->cpuAffinity);
   }
   while (1) {
-    std::unique_lock<std::mutex> lock(ginState->mutex);
-    if (ginState->proxyThreadStopSignal) return NULL;
-    struct ncclGinStateDevComm* dc = ginState->devComms;
-    while (dc) {
-      struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
-      for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
-        if (dc->devHandles[commIdx]->needsProxyProgress) {
-          ncclResult_t ret = backend->ncclGin->ginProgress(dc->ginCtx[commIdx]);
-          if (ret != ncclSuccess) {
-            COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
-            INFO_LOC(NCCL_ALL, "-> %d [GIN Progress Thread]", ret);
-            return NULL;
+    int state = ginState->progressState.load(std::memory_order_acquire);
+    if (state == ncclGinProgressStop) return NULL;
+    // Back off while the main thread is mutating the devComms list.
+    if (state == ncclGinProgressWritePending) {
+      std::this_thread::yield();
+      continue;
+    }
+    {
+      std::shared_lock<std::shared_timed_mutex> rlock(ginState->devCommRwMutex);
+      struct ncclGinStateDevComm* dc = ginState->devComms;
+      while (dc) {
+        struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
+        for (int commIdx = threadIdx; commIdx < backend->ginCommCount; commIdx += ginState->proxyNthreads) {
+          if (dc->devHandles[commIdx]->needsProxyProgress) {
+            ncclResult_t ret = backend->ncclGin->ginProgress(dc->ginCtx[commIdx]);
+            if (ret != ncclSuccess) {
+              COMPILER_ATOMIC_STORE(&ginState->asyncResult, ret, std::memory_order_release);
+              INFO_LOC(NCCL_ALL, "-> %d [GIN Progress Thread %d]", ret, threadIdx);
+              return NULL;
+            }
           }
         }
+        dc = dc->next;
       }
-      dc = dc->next;
     }
-    lock.unlock();
     std::this_thread::yield();
   }
 }
 
 NCCL_PARAM(GinNconnections, "GIN_NCONNECTIONS", -2);
+NCCL_PARAM(GinProxyNthreads, "GIN_PROXY_NTHREADS", 1);
 
 ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   ncclTeam_t ginTeam;
@@ -137,14 +157,27 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
 
     backend->ginCommCount = nLocalGinDevs;
 
+    // Resolve the number of GIN progress threads. Default 1; Max NCCL_GIN_MAX_CONNECTIONS.
+    ginState->proxyNthreads = 1;
+    if (ncclParamGinProxyNthreads() > 1) ginState->proxyNthreads = ncclParamGinProxyNthreads();
+    ginState->proxyNthreads = std::min<int>(NCCL_GIN_MAX_CONNECTIONS, ginState->proxyNthreads);
+
     if (ncclParamGinNconnections() != -2) backend->ginCommCount = ncclParamGinNconnections();
     backend->ginCommCount = std::min<int>(NCCL_GIN_MAX_CONNECTIONS, backend->ginCommCount);
+    // Ensure ginCommCount >= proxyNthreads before AllGather.
+    if (backend->ginCommCount < ginState->proxyNthreads) {
+      backend->ginCommCount = ginState->proxyNthreads;
+      INFO(NCCL_INIT, "GIN: increased ginCommCount to %d to match GIN_PROXY_NTHREADS", backend->ginCommCount);
+    }
 
     ginCommCountHandles[comm->rank] = backend->ginCommCount;
     NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, ginCommCountHandles, sizeof(int)), ret, fail);
     for (int r = 0; r < comm->nRanks; r++) {
       backend->ginCommCount = std::min(backend->ginCommCount, ginCommCountHandles[r]);
     }
+    // After cross-rank min, proxyNthreads may exceed ginCommCount if ranks disagree
+    // on NCCL_GIN_PROXY_NTHREADS (atypical — env vars are normally uniform across a job).
+    // Extra threads simply idle in the stride loop; no correctness issue.
 
     for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
       NCCLCHECKGOTO(backend->ncclGin->listen(backend->ginInstance, localGinDevs[commIdx % nLocalGinDevs],
@@ -296,6 +329,7 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
   }
 
   ncclResult_t ret = ncclSuccess;
+  bool needsProxyProgress = false;
 
   int connectedStride =
     comm->sharedRes->ginState.ginConnectionType == NCCL_GIN_CONNECTION_FULL ? 1 : comm->contiguousRanksPerHost;
@@ -355,25 +389,31 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
     }
     devComm->ginNetDeviceTypes[commIdx] = ginStateDevComm->devHandles[commIdx]->netDeviceType;
     devComm->ginHandles[commIdx] = ginStateDevComm->devHandles[commIdx]->handle;
-
-    // Start proxy thread if needed
-    if (ginStateDevComm->devHandles[commIdx]->needsProxyProgress && !ginState->proxyThreadCreated) {
-      ginState->cpuAffinity = comm->cpuAffinity;
-      ginState->proxyThreadCreated = true;
-      ginState->thread = std::thread(ncclGinProgress, ginState);
-      ncclSetThreadName(ginState->thread, "NCCL GIN Progress%2d", comm->cudaDev);
-    }
+    if (ginStateDevComm->devHandles[commIdx]->needsProxyProgress) needsProxyProgress = true;
   }
 
-  // Add devComm context to the list
+  // Add devComm and (re)start progress threads as needed.
   {
-    std::unique_lock<std::mutex> lock(ginState->mutex);
+    bool needsStart = needsProxyProgress &&
+                      ginState->progressState.load(std::memory_order_acquire) == ncclGinProgressNotStarted;
+
+    if (!needsStart) ginProgressWriteLock(ginState);
     struct ncclGinStateDevComm* last = ginState->devComms;
     if (last) {
       while (last->next) last = last->next;
       last->next = ginStateDevComm;
     } else {
       ginState->devComms = ginStateDevComm;
+    }
+    if (!needsStart) ginProgressWriteUnlock(ginState);
+
+    if (needsStart) {
+      ginState->cpuAffinity = comm->cpuAffinity;
+      ginState->progressState.store(ncclGinProgressRunning, std::memory_order_release);
+      for (int t = 0; t < ginState->proxyNthreads; t++) {
+        ginState->thread[t] = std::thread([ginState, t] { ncclGinProgress(ginState, t); });
+        ncclSetThreadName(ginState->thread[t], "NCCL GIN Progress%2d-%d", comm->cudaDev, t);
+      }
     }
   }
 
@@ -388,9 +428,11 @@ end:
   return ret;
 }
 
+// Called from main thread.
 ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const* devComm) {
   // Find the resource associated with this devComm. Use the gin handle as key.
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
+
   struct ncclGinStateDevComm *dc = ginState->devComms, *prevDc = NULL;
   while (1) {
     if (dc == NULL) {
@@ -402,14 +444,15 @@ ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const*
     dc = dc->next;
   }
 
-  std::unique_lock<std::mutex> lock(ginState->mutex);
+  ginProgressWriteLock(ginState);
   // Remove from linked list
   if (prevDc) prevDc->next = dc->next;
   else ginState->devComms = dc->next;
-  lock.unlock();
+  ginProgressWriteUnlock(ginState);
 
   struct ncclGinBackendState* backend = &ginState->backends[dc->backendIndex];
-  // Free GIN contexts
+  // The devComm is now unreachable by any progress thread; safe to destroy
+  // its contexts while the workers keep progressing the rest of the list.
   for (int commIdx = 0; commIdx < backend->ginCommCount; commIdx++) {
     NCCLCHECK(backend->ncclGin->destroyContext(dc->ginCtx[commIdx]));
   }
@@ -421,12 +464,11 @@ ncclResult_t ncclGinHostFinalize(struct ncclComm* comm) {
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
   if (!ginState->connected) return ncclSuccess;
 
-  if (ginState->proxyThreadCreated) {
-    {
-      std::lock_guard<std::mutex> lock(ginState->mutex);
-      ginState->proxyThreadStopSignal = true;
+  if (ginState->progressState.load(std::memory_order_acquire) == ncclGinProgressRunning) {
+    ginState->progressState.store(ncclGinProgressStop, std::memory_order_release);
+    for (int t = 0; t < ginState->proxyNthreads; t++) {
+      if (ginState->thread[t].joinable()) ginState->thread[t].join();
     }
-    ginState->thread.join();
   }
 
   for (int backendIdx = 0; backendIdx < ginState->numActiveBackends; backendIdx++) {
