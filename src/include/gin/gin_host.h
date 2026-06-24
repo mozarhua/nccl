@@ -58,11 +58,12 @@ struct ncclGinState {
   // proxyNthreads <= ginCommCount <= NCCL_GIN_MAX_CONNECTIONS, these arrays are
   // safely sized.
   int proxyNthreads;           // Number of GIN progress threads.
-  bool proxyThreadsStarted;         // True once progress threads have been spawned.
-  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine: 0=paused, 1=running, 2=pause-requested, -1=exit, -2=errored
+  bool proxyThreadsStarted;    // True once progress threads have been spawned.
+  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine
   std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
-  std::mutex mutex[NCCL_GIN_MAX_CONNECTIONS];
+  std::mutex threadMutex[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread pause/resume state
   std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
+  std::mutex mutex;            // Serializes DevCommSetup/Free against each other.
   ncclResult_t asyncResult;
 
   struct ncclGinStateDevComm* devComms;
