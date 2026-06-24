@@ -92,14 +92,25 @@ struct ncclGinBackendState {
   bool supportsVASignals;
 };
 
+// Per-thread GIN progress thread state machine.
+enum ncclGinProgressState {
+  ncclGinProgressPaused        =  0,  // Paused -- waiting for cond signal.
+  ncclGinProgressRunning       =  1,  // Running -- traversing devComms.
+  ncclGinProgressPauseReq      =  2,  // Pause requested -- will ack by moving to Paused.
+  ncclGinProgressExit          = -1,  // Clean shutdown requested.
+  ncclGinProgressError         = -2,  // Terminal error.
+};
+
 struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;
   int proxyNthreads;
   bool proxyThreadsStarted;
-  std::thread thread;
-  std::mutex mutex;
+  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine
+  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
+  std::mutex mutex[NCCL_GIN_MAX_CONNECTIONS];
+  std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
   ncclResult_t asyncResult;
   struct ncclGinStateDevComm* devComms;
   ncclGinConnectionType_t ginConnectionType;
