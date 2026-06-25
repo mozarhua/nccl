@@ -64,5 +64,10 @@ typedef struct {
 
   // Finalize the GIN support
   ncclResult_t (*finalize)(void* ctx);
+
+  // Set a hint on the context before listen(). Allows NCCL to pass per-connection
+  // metadata (e.g., "THREAD_POOL_IDX") without changing listen() signature.
+  // Plugin may ignore unknown keys. May be NULL if not supported.
+  ncclResult_t (*setHint)(void* ctx, const char* key, int value);
 } ncclGin_v14_t;
 #endif // end include guard

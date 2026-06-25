@@ -91,6 +91,7 @@ ncclRma_t* getNcclRma_v13(void* lib) {
     ncclRma.rmaProgress = ncclRma_v13->ginProgress;
     ncclRma.queryLastError = ncclRma_v13->queryLastError;
     ncclRma.finalize = ncclRma_v13->finalize;
+    ncclRma.setHint = ncclRma_v13->setHint;
     return &ncclRma;
   }
   return nullptr;

@@ -650,6 +650,13 @@ static ncclResult_t ncclGinProxyQueryLastError(void* ginCtx, bool* hasError) {
   return ncclSuccess;
 }
 
+static ncclResult_t ncclGinProxySetHint(void* ctx, const char* key, int value) {
+  if (rmaBackend && rmaBackend->setHint) {
+    return rmaBackend->setHint(ctx, key, value);
+  }
+  return ncclSuccess;  // No-op if plugin doesn't support setHint
+}
+
 ncclGin_t ncclGinProxy{
   NULL, // Will map directly to the plugin: name
   NULL, // Will map directly to the plugin: init()
@@ -667,7 +674,8 @@ ncclGin_t ncclGinProxy{
   ncclGinProxyCloseListen,
   ncclGinProxyProgress,
   ncclGinProxyQueryLastError,
-  NULL  // Will map directly to the plugin: finalize()
+  NULL, // Will map directly to the plugin: finalize()
+  ncclGinProxySetHint
 };
 
 int ncclGinProxyVersion = -1;

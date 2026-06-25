@@ -241,6 +241,9 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   }
 
   for (int n = 0; n < backend->ginCommCount; n++) {
+    if (backend->ncclGin->setHint) {
+      NCCLCHECKGOTO(backend->ncclGin->setHint(backend->ginInstance, "THREAD_IDX", n % nthreads), ret, fail);
+    }
     NCCLCHECKGOTO(backend->ncclGin->listen(backend->ginInstance, localGinDevs[n % nLocalGinDevs],
                                            allHandles + NCCL_NET_HANDLE_MAXSIZE * comm->rank, &listenComm),
                   ret, fail);

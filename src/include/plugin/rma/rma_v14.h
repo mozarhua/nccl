@@ -66,5 +66,8 @@ typedef struct {
 
   // Finalize the RMA support
   ncclResult_t (*finalize)(void* ctx);
+
+  // Set a hint on the context before listen(). May be NULL if not supported.
+  ncclResult_t (*setHint)(void* ctx, const char* key, int value);
 } ncclRma_v14_t;
 #endif // end include guard
