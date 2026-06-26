@@ -47,22 +47,28 @@ enum ncclGinProgressState {
   ncclGinProgressError         = -2,  // Terminal error.
 };
 
+// GIN progress threading mode.
+enum ncclGinProgressMode {
+  ncclGinProgressLegacy = 0,  // Original single thread per comm.
+  ncclGinProgressPool   = 1,  // Per-device global thread pool.
+};
+
 struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;              // True if any backend is loaded on this comm.
+  ncclGinProgressMode progressMode;  // Set once in ncclGinConnectOnce.
 
-  // Per-thread GIN progress state. We run `proxyNthreads` progress threads;
-  // thread t owns connections t, t+proxyNthreads, t+2*proxyNthreads, ...
-  // (of backends[0]) across all devComms in the list below. Since
-  // proxyNthreads <= ginCommCount <= NCCL_GIN_MAX_CONNECTIONS, these arrays are
-  // safely sized.
-  int proxyNthreads;           // Number of GIN progress threads.
-  bool proxyThreadsStarted;    // True once progress threads have been spawned.
-  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine
-  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
-  std::mutex mutex[NCCL_GIN_MAX_CONNECTIONS];
-  std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
+  // Legacy mode (NCCL_GIN_PROXY_NTHREADS < 1): original single-thread fields.
+  bool progressStarted;      // True if progress is active (legacy thread or pool).
+  bool proxyThreadStopSignal;  // Signals the GIN progress thread to exit.
+  std::thread thread;
+  std::mutex mutex;
+
+  // Pool mode (NCCL_GIN_PROXY_NTHREADS >= 1): pool threads live in the global
+  // g_progressPool[cudaDev]. These fields track per-comm pool participation.
+  int proxyNthreads;           // Number of threads in the pool (0 if legacy).
+
   ncclResult_t asyncResult;
 
   struct ncclGinStateDevComm* devComms;

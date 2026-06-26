@@ -105,12 +105,13 @@ struct ncclGinState {
   ncclAffinity cpuAffinity;
   bool connected;
   bool supported;
+  int progressMode;
+  bool progressStarted;
+  bool proxyThreadStopSignal;
+  std::thread thread;
+  std::mutex mutex;
   int proxyNthreads;
-  bool proxyThreadsStarted;
-  int ginProgress[NCCL_GIN_MAX_CONNECTIONS];  // Per-thread state machine
-  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
-  std::mutex mutex[NCCL_GIN_MAX_CONNECTIONS];
-  std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
+
   ncclResult_t asyncResult;
   struct ncclGinStateDevComm* devComms;
   ncclGinConnectionType_t ginConnectionType;
