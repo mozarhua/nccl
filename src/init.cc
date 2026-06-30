@@ -2920,6 +2920,8 @@ static ncclResult_t commReclaim(struct ncclAsyncJob* job_) {
 
     assert(intracomm0 != NULL && finalizeRankCnt != NULL);
     curRankCnt = COMPILER_ATOMIC_ADD_FETCH(finalizeRankCnt, 1, std::memory_order_acq_rel);
+    INFO(NCCL_ALL, "commReclaim: comm %p rank %d curRankCnt=%d intraRanks=%d (waiting for all local ranks)",
+         comm, comm->rank, curRankCnt, intraRanks);
     if (curRankCnt == intraRanks) {
       ncclComm_t curIntraComm;
       ncclComm_t nextIntraComm = intracomm0;

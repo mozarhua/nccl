@@ -79,12 +79,15 @@ struct ncclGinThreadPool {
   int nthreads = 0;
   bool started = false;
   int refCount = 0;
+  int nextThread = 0;       // Global round-robin counter for ginCtx assignment
+  int nextListenThread = 0; // Global counter for setHint before listen()
   ncclAffinity cpuAffinity;
+  int devIdx = -1;          // For debug logging in destructor
 
-  std::thread thread[NCCL_GIN_MAX_CONNECTIONS];
-  std::mutex threadMutex[NCCL_GIN_MAX_CONNECTIONS];
-  std::condition_variable cond[NCCL_GIN_MAX_CONNECTIONS];
-  int state[NCCL_GIN_MAX_CONNECTIONS] = {};  // ncclGinProgressState
+  std::thread thread[NCCL_MAX_LOCAL_RANKS];
+  std::mutex threadMutex[NCCL_MAX_LOCAL_RANKS];
+  std::condition_variable cond[NCCL_MAX_LOCAL_RANKS];
+  int state[NCCL_MAX_LOCAL_RANKS] = {};  // ncclGinProgressState
 
   struct WorkItem {
     ncclGinState* ginState;
@@ -92,7 +95,27 @@ struct ncclGinThreadPool {
     ncclGin_t* ncclGin;
     bool disabled;  // Set on error; skipped on subsequent iterations.
   };
-  std::vector<WorkItem> workList[NCCL_GIN_MAX_CONNECTIONS];
+  std::vector<WorkItem> workList[NCCL_MAX_LOCAL_RANKS];
+
+  ~ncclGinThreadPool() {
+    if (started) {
+      INFO(NCCL_ALL, "GIN pool: destructor dev=%d refCount=%d nthreads=%d -- threads still alive, signaling exit",
+           devIdx, refCount, nthreads);
+      for (int t = 0; t < nthreads; t++) {
+        std::unique_lock<std::mutex> lk(threadMutex[t]);
+        INFO(NCCL_ALL, "GIN pool: destructor dev=%d thread=%d state=%d workItems=%zu",
+             devIdx, t, state[t], workList[t].size());
+        state[t] = ncclGinProgressExit;
+        cond[t].notify_one();
+        lk.unlock();
+      }
+      for (int t = 0; t < nthreads; t++) {
+        if (thread[t].joinable()) thread[t].join();
+      }
+      started = false;
+      INFO(NCCL_ALL, "GIN pool: destructor dev=%d -- all threads joined", devIdx);
+    }
+  }
 };
 static ncclGinThreadPool g_progressPool[NCCL_MAX_LOCAL_RANKS];
 
@@ -127,6 +150,7 @@ static void* ncclGinPoolProgress(int dev, int t) {
   if (ncclOsCpuCount(pool.cpuAffinity)) {
     ncclOsSetAffinity(pool.cpuAffinity);
   }
+  INFO(NCCL_ALL, "GIN pool: dev=%d thread=%d started (initial state=Paused)", dev, t);
   while (true) {
     std::unique_lock<std::mutex> lock(pool.threadMutex[t]);
     if (pool.state[t] == ncclGinProgressRunning) {
@@ -147,6 +171,7 @@ static void* ncclGinPoolProgress(int dev, int t) {
     } else if (pool.state[t] == ncclGinProgressPaused) {
       pool.cond[t].wait(lock);
     } else if (pool.state[t] == ncclGinProgressExit) {
+      INFO(NCCL_ALL, "GIN pool: dev=%d thread=%d exiting", dev, t);
       return NULL;
     }
   }
@@ -175,6 +200,7 @@ static void resumeThreadPool(int dev) {
     if (pool.state[t] == ncclGinProgressPaused && !pool.workList[t].empty()) {
       pool.state[t] = ncclGinProgressRunning;
       pool.cond[t].notify_one();
+      INFO(NCCL_ALL, "GIN pool: dev=%d thread=%d resumed (workItems=%zu)", dev, t, pool.workList[t].size());
     }
   }
 }
@@ -185,6 +211,7 @@ static void initThreadPool(int dev, int nthreads, ncclAffinity cpuAffinity) {
   auto& pool = g_progressPool[dev];
   std::lock_guard<std::mutex> lock(pool.poolMutex);
   if (pool.started) return;
+  pool.devIdx = dev;
   pool.nthreads = nthreads;
   pool.cpuAffinity = cpuAffinity;
   for (int t = 0; t < nthreads; t++) {
@@ -253,10 +280,9 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
   nthreads = (int)ncclParamGinProxyNthreads();
   if (nthreads < 1) {
     nthreads = 1;
-  } else if (nthreads > NCCL_GIN_MAX_CONNECTIONS) {
-    WARN("GIN_PROXY_NTHREADS=%d exceeds the maximum number of connections %d; clamping to %d", nthreads,
-         NCCL_GIN_MAX_CONNECTIONS, NCCL_GIN_MAX_CONNECTIONS);
-    nthreads = NCCL_GIN_MAX_CONNECTIONS;
+  } else if (nthreads > NCCL_MAX_LOCAL_RANKS) {
+    WARN("GIN_PROXY_NTHREADS=%d exceeds maximum %d; clamping", nthreads, NCCL_MAX_LOCAL_RANKS);
+    nthreads = NCCL_MAX_LOCAL_RANKS;
   }
 
   if (ncclParamGinNconnections() != -2) backend->ginCommCount = ncclParamGinNconnections();
@@ -268,13 +294,6 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
     backend->ginCommCount = std::min(backend->ginCommCount, ginCommCountHandles[r]);
   }
 
-  // Now that the final connection count is known (after the cross-rank min),
-  // clamp the thread count to it: we never spawn empty-range threads.
-  if (nthreads > backend->ginCommCount) {
-    INFO(NCCL_INIT, "GIN: clamping GIN_PROXY_NTHREADS from %d to %d (resolved ginCommCount)", nthreads,
-         backend->ginCommCount);
-    nthreads = backend->ginCommCount;
-  }
   ginState->proxyNthreads = nthreads;
   ginState->progressMode = useGlobalThreadPool() ? ncclGinProgressPool : ncclGinProgressLegacy;
   INFO(NCCL_INIT, "GIN: %d connection(s), %d progress thread(s), mode=%s",
@@ -299,9 +318,16 @@ ncclResult_t ncclGinConnectOnce(struct ncclComm* comm) {
     handles[r] = allHandles + worldRank * NCCL_NET_HANDLE_MAXSIZE;
   }
 
+  // Initialize pool before listen so nextListenThread is available.
+  if (ginState->progressMode == ncclGinProgressPool) {
+    initThreadPool(comm->cudaDev, (int)ncclParamGinProxyNthreads(), comm->cpuAffinity);
+  }
+
   for (int n = 0; n < backend->ginCommCount; n++) {
-    if (backend->ncclGin->setHint) {
-      NCCLCHECKGOTO(backend->ncclGin->setHint(backend->ginInstance, "THREAD_IDX", n % nthreads), ret, fail);
+    if (backend->ncclGin->setHint && ginState->progressMode == ncclGinProgressPool) {
+      auto& pool = g_progressPool[comm->cudaDev];
+      int threadIdx = pool.nextListenThread++ % pool.nthreads;
+      NCCLCHECKGOTO(backend->ncclGin->setHint(backend->ginInstance, "THREAD_IDX", threadIdx), ret, fail);
     }
     NCCLCHECKGOTO(backend->ncclGin->listen(backend->ginInstance, localGinDevs[n % nLocalGinDevs],
                                            allHandles + NCCL_NET_HANDLE_MAXSIZE * comm->rank, &listenComm),
@@ -481,7 +507,7 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
   if (ginState->progressMode == ncclGinProgressPool) {
     // Pool mode: register ginCtx with per-device shared thread pool.
     int dev = comm->cudaDev;
-    initThreadPool(dev, ginState->proxyNthreads, comm->cpuAffinity);
+    initThreadPool(dev, (int)ncclParamGinProxyNthreads(), comm->cpuAffinity);
     auto& pool = g_progressPool[dev];
     std::lock_guard<std::mutex> plock(pool.poolMutex);
 
@@ -496,7 +522,7 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
     }
 
     for (int n = 0; n < backend->ginCommCount; n++) {
-      int t = n % pool.nthreads;
+      int t = pool.nextThread++ % pool.nthreads;
       pool.workList[t].push_back({ginState, ginStateDevComm->ginCtx[n], backend->ncclGin, false});
       INFO(NCCL_INIT, "GIN pool: dev=%d thread=%d registered ginCtx[%d]=%p (ginState=%p)",
            dev, t, n, ginStateDevComm->ginCtx[n], ginState);
@@ -541,10 +567,17 @@ ncclResult_t ncclGinDevCommFree(struct ncclComm* comm, struct ncclDevComm const*
   struct ncclGinState* ginState = &comm->sharedRes->ginState;
   struct ncclGinBackendState* backend = &ginState->backends[0];
 
+  INFO(NCCL_ALL, "GIN DevCommFree: dev=%d progressMode=%d ginState=%p devComm=%p",
+       comm->cudaDev, ginState->progressMode, ginState, devComm);
+
   if (ginState->progressMode == ncclGinProgressPool) {
     int dev = comm->cudaDev;
     auto& pool = g_progressPool[dev];
     std::lock_guard<std::mutex> plock(pool.poolMutex);
+
+    INFO(NCCL_ALL, "GIN DevCommFree: dev=%d pool refCount=%d started=%d nthreads=%d",
+         dev, pool.refCount, pool.started, pool.nthreads);
+
     pauseThreadPool(dev);
 
     // Locate and unlink devComm
@@ -602,12 +635,18 @@ ncclResult_t ncclGinHostFinalize(struct ncclComm* comm) {
   if (!ginState->connected) return ncclSuccess;
   struct ncclGinBackendState* backend = &ginState->backends[0];
 
+  INFO(NCCL_ALL, "GIN HostFinalize: dev=%d progressMode=%d ginState=%p",
+       comm->cudaDev, ginState->progressMode, ginState);
+
   if (ginState->progressMode == ncclGinProgressPool) {
     int dev = comm->cudaDev;
     auto& pool = g_progressPool[dev];
     std::lock_guard<std::mutex> plock(pool.poolMutex);
     pool.refCount--;
+    INFO(NCCL_ALL, "GIN HostFinalize: dev=%d pool refCount=%d->%d started=%d",
+         dev, pool.refCount + 1, pool.refCount, pool.started);
     if (pool.refCount == 0) {
+      INFO(NCCL_ALL, "GIN HostFinalize: dev=%d refCount=0, joining %d threads", dev, pool.nthreads);
       for (int t = 0; t < pool.nthreads; t++) {
         std::lock_guard<std::mutex> tlock(pool.threadMutex[t]);
         pool.state[t] = ncclGinProgressExit;
@@ -617,6 +656,7 @@ ncclResult_t ncclGinHostFinalize(struct ncclComm* comm) {
         if (pool.thread[t].joinable()) pool.thread[t].join();
       }
       pool.started = false;
+      INFO(NCCL_ALL, "GIN HostFinalize: dev=%d all threads joined", dev);
     }
   } else {
     // Legacy mode
