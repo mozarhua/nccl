@@ -26,8 +26,8 @@ struct ncclDevComm_v22907 {
   ncclGinBarrierHandle_t railGinBarrier;
 
   uint8_t ginConnectionCount;
-  uint8_t ginNetDeviceTypes[NCCL_GIN_MAX_CONNECTIONS];
-  void* ginHandles[NCCL_GIN_MAX_CONNECTIONS];
+  uint8_t ginNetDeviceTypes[NCCL_GIN_MAX_CONNECTIONS_V22902];
+  void* ginHandles[NCCL_GIN_MAX_CONNECTIONS_V22902];
   uint32_t ginSignalBase;
   int ginSignalCount;
   uint32_t ginCounterBase;

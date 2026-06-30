@@ -80,16 +80,20 @@ template <typename GinType>
 NCCL_DEVICE_INLINE void ncclGinInitCommon(GinType* gin, ncclDevComm const& comm, int contextIndex) {
   gin->nConnections = comm.ginConnectionCount;
 
-  static_assert(NCCL_GIN_MAX_CONNECTIONS == 4, "Required for following modulo hack to work.");
+  static_assert(NCCL_GIN_MAX_CONNECTIONS == 8, "Required for following modulo hack to work.");
   // this->connectionId = contextIndex % comm.ginConnectionCount;
   gin->connectionId = comm.ginConnectionCount == 3 ? uint32_t(contextIndex) % 3 // 3 is only non power of 2
+                      : comm.ginConnectionCount == 5 ? uint32_t(contextIndex) % 5
+                      : comm.ginConnectionCount == 7 ? uint32_t(contextIndex) % 7
                                                      :
                                                      contextIndex & (comm.ginConnectionCount - 1); // powers of 2
   // gin->contextId = contextIndex / comm.ginConnectionCount;
   gin->contextId = comm.ginConnectionCount == 3 ?
-                     uint32_t(contextIndex) / 3 // 3 is only non power of 2
-                     :
-                     contextIndex >> (comm.ginConnectionCount == 4 ? 2 : comm.ginConnectionCount - 1); // powers of 2
+                     uint32_t(contextIndex) / 3
+                   : comm.ginConnectionCount == 5 ? uint32_t(contextIndex) / 5
+                   : comm.ginConnectionCount == 7 ? uint32_t(contextIndex) / 7
+                   :
+                     contextIndex >> __ffs(comm.ginConnectionCount) - 1; // powers of 2: shift by log2
 
   gin->_ginBackend = comm.ginNetDeviceTypes[gin->connectionId];
   gin->_ginHandle = comm.ginHandles[gin->connectionId];

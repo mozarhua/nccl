@@ -21,7 +21,7 @@
 #include <thread>
 #include <mutex>
 
-#define NCCL_GIN_MAX_CONNECTIONS 4
+#define NCCL_GIN_MAX_CONNECTIONS 8
 
 typedef void* ncclGinWindow_t;
 

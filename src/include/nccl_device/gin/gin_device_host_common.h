@@ -12,7 +12,7 @@
 #include "../net_device.h"
 #include "../core.h"  // for ncclGin{Signal|Counter}_t
 
-#define NCCL_GIN_MAX_CONNECTIONS 4
+#define NCCL_GIN_MAX_CONNECTIONS 8
 
 typedef struct ncclGinGpuCtx* ncclGinGpuCtx_t;
 typedef void* ncclGinWindow_t;

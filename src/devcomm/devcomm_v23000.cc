@@ -28,9 +28,11 @@ struct ncclDevComm_v23000 {
   ncclLsaBarrierHandle_t lsaBarrier;
   ncclGinBarrierHandle_t railGinBarrier;
 
+  // Binary-compatible layout for NCCL v23000. Do not modify.
+  #define NCCL_GIN_MAX_CONNECTIONS_V23000 4
   uint8_t ginConnectionCount;
-  uint8_t ginNetDeviceTypes[NCCL_GIN_MAX_CONNECTIONS];
-  void* ginHandles[NCCL_GIN_MAX_CONNECTIONS];
+  uint8_t ginNetDeviceTypes[NCCL_GIN_MAX_CONNECTIONS_V23000];
+  void* ginHandles[NCCL_GIN_MAX_CONNECTIONS_V23000];
   int ginSignalCount;
   int ginCounterCount;
   uint64_t* ginSignalShadows;
